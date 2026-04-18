@@ -229,17 +229,58 @@ def sample_points_from_mask(mask):
     return tuple(sample_point)
 
 
-def search_new_obj(masks_from_prev, mask_list,other_masks_list=None,mask_ratio_thresh=0,ratio=0.5, area_threash = 5000):
+def search_new_obj(
+    masks_from_prev,
+    mask_list,
+    other_masks_list=None,
+    mask_ratio_thresh=0,
+    ratio=0.5,
+    area_threash=5000,
+    allow_contained_obj=True,
+    contained_ratio=0.8,
+    contained_max_iou=0.6,
+    contained_max_area_ratio=0.5,
+):
     new_mask_list = []
 
     # 计算mask_none，表示不包含在任何一个之前的mask中的区域
-    mask_none = ~masks_from_prev[0].copy()[0]
-    for prev_mask in masks_from_prev[1:]:
-        mask_none &= ~prev_mask[0]
+    prev_masks = [prev_mask[0] for prev_mask in masks_from_prev]
+    prev_areas = [max(int(prev_mask.sum()), 1) for prev_mask in prev_masks]
+    mask_none = ~prev_masks[0].copy()
+    for prev_mask in prev_masks[1:]:
+        mask_none &= ~prev_mask
+
+    def is_new_mask(seg):
+        seg_area = int(seg.sum())
+        if seg_area <= area_threash:
+            return False
+
+        uncovered_ratio = float((mask_none & seg).sum()) / seg_area
+        if uncovered_ratio > ratio:
+            return True
+
+        if not allow_contained_obj:
+            return False
+
+        # Allow contained small objects that were previously absorbed by a larger mask.
+        for prev_mask, prev_area in zip(prev_masks, prev_areas):
+            inter = int((prev_mask & seg).sum())
+            if inter == 0:
+                continue
+            inside_ratio = inter / seg_area
+            iou = inter / float((prev_mask | seg).sum())
+            area_ratio = seg_area / float(prev_area)
+            if (
+                inside_ratio >= contained_ratio
+                and iou <= contained_max_iou
+                and area_ratio <= contained_max_area_ratio
+            ):
+                return True
+        return False
 
     for mask in mask_list:
         seg = mask['segmentation']
-        if (mask_none & seg).sum()/seg.sum() > ratio and seg.sum() > area_threash:
+        if is_new_mask(seg):
             new_mask_list.append(mask)
     
     for mask in new_mask_list:
@@ -252,7 +293,7 @@ def search_new_obj(masks_from_prev, mask_list,other_masks_list=None,mask_ratio_t
         for mask in other_masks_list:
             if mask_none.sum() / (mask_none.shape[0] * mask_none.shape[1]) > mask_ratio_thresh: # 还有很多的空隙，大于当前 thresh
                 seg = mask['segmentation']
-                if (mask_none & seg).sum()/seg.sum() > ratio and seg.sum() > area_threash:
+                if is_new_mask(seg):
                     new_mask_list.append(mask)
                     mask_none &= ~seg
             else:
@@ -347,8 +388,7 @@ class Prompts:
         else:
             raise StopIteration
         
-def get_video_segments(prompts_loader,predictor,inference_state,final_output=False):
-
+def get_video_segments(prompts_loader,predictor,inference_state,step,start_frame_idx,final_output=False):
     video_segments = {}
     for batch_prompts in tqdm(prompts_loader,desc="processing prompts\n"):
         predictor.reset_state(inference_state)
@@ -362,13 +402,19 @@ def get_video_segments(prompts_loader,predictor,inference_state,final_output=Fal
                     mask=prompt[1]
                 )
         # start_frame_idx = 0 if final_output else None
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-            if out_frame_idx not in video_segments:
-                video_segments[out_frame_idx] = { }
-            for i, out_obj_id in enumerate(out_obj_ids):
-                video_segments[out_frame_idx][out_obj_id]= (out_mask_logits[i] > 0.0).cpu().numpy()
+        if not final_output:
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state, max_frame_num_to_track=step, start_frame_idx=start_frame_idx):
+                if out_frame_idx not in video_segments:
+                    video_segments[out_frame_idx] = { }
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    video_segments[out_frame_idx][out_obj_id]= (out_mask_logits[i] > 0.0).cpu().numpy()
         
-        if final_output:
+        else:
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                if out_frame_idx not in video_segments:
+                    video_segments[out_frame_idx] = { }
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    video_segments[out_frame_idx][out_obj_id]= (out_mask_logits[i] > 0.0).cpu().numpy()
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state,reverse=True):
                 for i, out_obj_id in enumerate(out_obj_ids):
                     video_segments[out_frame_idx][out_obj_id]= (out_mask_logits[i] > 0.0).cpu().numpy()
@@ -386,6 +432,12 @@ if __name__ == '__main__':
     parser.add_argument("--pred_iou_thresh",type=float,default=0.7)
     parser.add_argument("--box_nms_thresh",type=float,default=0.7)
     parser.add_argument("--stability_score_thresh",type=float,default=0.85)
+    parser.add_argument("--new_obj_ratio", type=float, default=0.5)
+    parser.add_argument("--new_obj_area_thresh", type=int, default=1000)
+    parser.add_argument("--new_obj_allow_contained", type=int, default=1)
+    parser.add_argument("--new_obj_contained_ratio", type=float, default=0.8)
+    parser.add_argument("--new_obj_contained_max_iou", type=float, default=0.6)
+    parser.add_argument("--new_obj_contained_max_area_ratio", type=float, default=0.5)
     args = parser.parse_args()
     logger.add(os.path.join(args.output_dir,f'{args.level}.log'), rotation="500 MB")
     logger.info(args)
@@ -414,6 +466,11 @@ if __name__ == '__main__':
         min_mask_region_area=100,
     )
     # scan all the JPEG frame names in this directory
+    # frame_names = [
+    #     p for p in os.listdir(video_dir)
+    #     if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+    # ]
+    # frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     frame_names = [
         p for p in os.listdir(video_dir)
         if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png"]
@@ -425,35 +482,39 @@ if __name__ == '__main__':
     inference_state = predictor.init_state(video_path=video_dir)
     masks_from_prev = []
     sum_id = 0 # 记录一共有多少个物体
+    is_key_frame = True # frame 0 is key frame (whether use sam)
 
     prompts_loader = Prompts(bs=args.batch_size)  # hold all the clicks we add for visualization
-    while True:
+    for now_frame in range(0, len(frame_names), args.detect_stride):
         logger.info(f"frame: {now_frame}")
+        logger.info(f"is_key_frame: {is_key_frame}")
 
-        sum_id = prompts_loader.get_obj_num()
-        image_path = os.path.join(video_dir,frame_names[now_frame])
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        masks_default, masks_s, masks_m, masks_l = mask_generator.generate(image)
-        if args.postnms:
-            masks_default, masks_s, masks_m, masks_l = \
-                masks_update(masks_default, masks_s, masks_m, masks_l, iou_thr=0.8, score_thr=0.7, inner_thr=0.5)
-        if level == 'default':
-            masks = [mask for mask in masks_default]
-            other_masks = [mask for mask in masks_l] + [mask for mask in masks_m] + [mask for mask in masks_s] 
-        elif level == 'small':
-            masks = [mask for mask in masks_s]
-            other_masks = None
-        elif level == 'middle':
-            masks = [mask for mask in masks_m]
-            other_masks = [mask for mask in masks_s]
-        elif level == 'large':
-            masks = [mask for mask in masks_l]
-            other_masks = [mask for mask in masks_s] + [mask for mask in masks_m]
-        else:
-            raise NotImplementedError
-        if not args.use_other_level:
-            other_masks = None
+        if is_key_frame:
+            sum_id = prompts_loader.get_obj_num()
+            image_path = os.path.join(video_dir,frame_names[now_frame])
+            image = cv2.imread(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            masks_default, masks_s, masks_m, masks_l = mask_generator.generate(image)
+            if args.postnms:
+                masks_default, masks_s, masks_m, masks_l = \
+                    masks_update(masks_default, masks_s, masks_m, masks_l, iou_thr=0.8, score_thr=0.7, inner_thr=0.5)
+            if level == 'default':
+                masks = [mask for mask in masks_default]
+                other_masks = [mask for mask in masks_l] + [mask for mask in masks_m] + [mask for mask in masks_s] 
+            elif level == 'small':
+                masks = [mask for mask in masks_s]
+                other_masks = None
+            elif level == 'middle':
+                masks = [mask for mask in masks_m]
+                other_masks = [mask for mask in masks_s]
+            elif level == 'large':
+                masks = [mask for mask in masks_l]
+                other_masks = [mask for mask in masks_s] + [mask for mask in masks_m]
+            else:
+                raise NotImplementedError
+            if not args.use_other_level:
+                other_masks = None
+
         if now_frame == 0: # first frame
             ann_obj_id_list = range(len(masks))
 
@@ -479,22 +540,33 @@ if __name__ == '__main__':
 
         else:  
             save_masks([mask['segmentation'] for mask in masks],now_frame,os.path.join(base_dir,level,'mask_each_frame-sam1'))
-            new_mask_list = search_new_obj(masks_from_prev, masks, other_masks,mask_ratio_thresh)
-            logger.info(f"number of new obj: {len(new_mask_list)}")
-
             for id,mask in enumerate(masks_from_prev):
                 if mask.sum() == 0:
                     continue
                 prompts_loader.add(id,now_frame,mask[0])
-
-            for i in range(len(new_mask_list)):
-                new_mask = new_mask_list[i]['segmentation']
-                prompts_loader.add(sum_id+i,now_frame,new_mask)
+            if is_key_frame:
+                new_mask_list = search_new_obj(
+                    masks_from_prev,
+                    masks,
+                    other_masks,
+                    mask_ratio_thresh,
+                    ratio=args.new_obj_ratio,
+                    area_threash=args.new_obj_area_thresh,
+                    allow_contained_obj=bool(args.new_obj_allow_contained),
+                    contained_ratio=args.new_obj_contained_ratio,
+                    contained_max_iou=args.new_obj_contained_max_iou,
+                    contained_max_area_ratio=args.new_obj_contained_max_area_ratio,
+                )
+                logger.info(f"number of new obj: {len(new_mask_list)}")
+                
+                for i in range(len(new_mask_list)):
+                    new_mask = new_mask_list[i]['segmentation']
+                    prompts_loader.add(sum_id+i,now_frame,new_mask)
 
         logger.info(f"obj num: {prompts_loader.get_obj_num()}")
 
-        if now_frame==0 or len(new_mask_list)!=0:
-            video_segments = get_video_segments(prompts_loader,predictor,inference_state)
+        
+        video_segments = get_video_segments(prompts_loader,predictor,inference_state, args.detect_stride, now_frame)
         # video_segments contains the per-frame segmentation results
         
         vis_frame_stride = args.detect_stride
@@ -502,54 +574,52 @@ if __name__ == '__main__':
         save_dir = os.path.join(base_dir,level,f"mask_each_frame_sam2")
         os.makedirs(save_dir,exist_ok=True)
         os.makedirs(os.path.join(save_dir,f"now_frame_{now_frame}"),exist_ok=True)
-        max_area_no_mask = (0,-1)
-        for out_frame_idx in tqdm(range(0, len(frame_names), vis_frame_stride)):
-            if out_frame_idx < now_frame:
-                continue
-            # 创建一个新的图形对象
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.set_title(f"frame {out_frame_idx}")
-            
-            # 显示图像
-            img_path = os.path.join(video_dir, frame_names[out_frame_idx])
-            ax.imshow(Image.open(img_path))
-            # 显示分割掩码
-            out_mask_list = []
-            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                idx_save_dir = os.path.join(save_dir,f"obj_{out_obj_id:02}")
-                # os.makedirs(idx_save_dir,exist_ok=True)
-                # import ipdb; ipdb.set_trace()
-                show_mask(out_mask, ax, obj_id=out_obj_id,random_color=False)
-                out_mask_list.append(out_mask)
-            
-            no_mask_ratio = cal_no_mask_area_ratio(out_mask_list)
-            if now_frame == out_frame_idx:
-                mask_ratio_thresh = no_mask_ratio
-                logger.info(f"mask_ratio_thresh: {mask_ratio_thresh}")
 
-            save_masks(out_mask_list, out_frame_idx,os.path.join(save_dir,f"now_frame_{now_frame}"))
-            save_masks_npy(out_mask_list, out_frame_idx,os.path.join(save_dir,f"now_frame_{now_frame}"))
-            
-            # 保存图像
-            plt.savefig(os.path.join(save_dir, f"frame_{out_frame_idx}.png"))
-            
-            # 关闭当前图形对象，释放内存
-            plt.close(fig)
-            if no_mask_ratio > mask_ratio_thresh + 0.01 and out_frame_idx > now_frame:
-                masks_from_prev = out_mask_list
-                max_area_no_mask = (no_mask_ratio, out_frame_idx)
-                logger.info(max_area_no_mask)
-                # mask_ratio_thresh = no_mask_ratio
-                break
-        if max_area_no_mask[1] == -1:
+        out_frame_idx = now_frame+vis_frame_stride
+        if out_frame_idx >= len(frame_names):
             break
-        logger.info("max_area_no_mask:", max_area_no_mask)
-        now_frame = max_area_no_mask[1]
+        # 创建一个新的图形对象
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.set_title(f"frame {out_frame_idx}")
+        
+        # 显示图像
+        img_path = os.path.join(video_dir, frame_names[out_frame_idx])
+        ax.imshow(Image.open(img_path))
+        # 显示分割掩码
+        out_mask_list = []
+        for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+            idx_save_dir = os.path.join(save_dir,f"obj_{out_obj_id:02}")
+            # os.makedirs(idx_save_dir,exist_ok=True)
+            # import ipdb; ipdb.set_trace()
+            show_mask(out_mask, ax, obj_id=out_obj_id,random_color=False)
+            out_mask_list.append(out_mask)
+        
+        no_mask_ratio = cal_no_mask_area_ratio(out_mask_list)
+        if now_frame == 0:
+            mask_ratio_thresh = no_mask_ratio
+
+        save_masks(out_mask_list, out_frame_idx,os.path.join(save_dir,f"now_frame_{now_frame}"))
+        save_masks_npy(out_mask_list, out_frame_idx,os.path.join(save_dir,f"now_frame_{now_frame}"))
+        
+        # 保存图像
+        plt.savefig(os.path.join(save_dir, f"frame_{out_frame_idx}.png"))
+        
+        # 关闭当前图形对象，释放内存
+        plt.close(fig)
+        if no_mask_ratio > mask_ratio_thresh + 0.01:
+            masks_from_prev = out_mask_list
+            mask_ratio_thresh = no_mask_ratio
+            logger.info(f"mask_ratio_thresh: {mask_ratio_thresh}")
+            is_key_frame = True
+        else:
+            masks_from_prev = out_mask_list
+            is_key_frame = False
+            logger.info(f"mask_ratio_thresh: {mask_ratio_thresh}")
 
 
     ###### Final output ######
     save_dir = os.path.join(base_dir,level,"final-output")
-    video_segments = get_video_segments(prompts_loader,predictor,inference_state,final_output=True)
+    video_segments = get_video_segments(prompts_loader,predictor,inference_state,args.detect_stride,0,final_output=True)
     for out_frame_idx in tqdm(range(0, len(frame_names), 1)):
         out_mask_list = []
         for out_obj_id, out_mask in video_segments[out_frame_idx].items():
