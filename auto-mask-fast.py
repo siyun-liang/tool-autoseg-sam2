@@ -427,7 +427,7 @@ if __name__ == '__main__':
     parser.add_argument("--level",choices=['default','small','middle','large'])
     parser.add_argument("--batch_size",type=int,default=20)
     parser.add_argument("--detect_stride",type=int,default=10)
-    parser.add_argument("--use_other_level",type=int,default=1)
+    parser.add_argument("--use_other_level",type=int,default=0)
     parser.add_argument("--postnms",type=int,default=1)
     parser.add_argument("--pred_iou_thresh",type=float,default=0.7)
     parser.add_argument("--box_nms_thresh",type=float,default=0.7)
@@ -451,10 +451,8 @@ if __name__ == '__main__':
 
     predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 
-    sam2 = build_sam2(model_cfg, sam2_checkpoint, device ='cuda', apply_postprocessing=False)
-
     sam_ckpt_path="checkpoints/sam1/sam_vit_h_4b8939.pth"
-    sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt_path).to('cuda')
+    sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt_path).to('cpu')
     mask_generator = SamAutomaticMaskGenerator(
         model=sam,
         points_per_side=32,
