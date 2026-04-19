@@ -2,11 +2,33 @@ import os
 import numpy as np
 import torch
 import argparse
-import shutil
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dataset import Autoencoder_dataset
 from model import Autoencoder,VanillaVAE
+
+
+def resolve_feature_files(dataset_path, language_name, levels):
+    files = []
+    for lv in levels:
+        lv_dir = os.path.join(dataset_path, lv, language_name)
+        if not os.path.isdir(lv_dir):
+            continue
+        files.extend(sorted([os.path.join(lv_dir, x) for x in os.listdir(lv_dir) if x.endswith("_f.npy")]))
+    return files
+
+
+def output_root_for_input(input_f_path, dataset_path, language_name, out_dir_name):
+    # aggregate layout: <dataset>/<level>/<language_name>/<frame>_f.npy
+    abs_dataset = os.path.abspath(dataset_path)
+    abs_input = os.path.abspath(input_f_path)
+    rel = os.path.relpath(abs_input, abs_dataset)
+    parts = rel.split(os.sep)
+    if len(parts) >= 3:
+        level = parts[0]
+        return os.path.join(abs_dataset, level, out_dir_name)
+    return os.path.join(abs_dataset, out_dir_name)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -32,7 +54,14 @@ if __name__ == '__main__':
                     )
     # parser.add_argument("--output_dim", type=int, default=3)
     parser.add_argument('--language_name', type = str, default = None)
-    parser.add_argument('--output_name',type=str,default=None)
+    parser.add_argument('--output_name',type=str,default='clip_features')
+    parser.add_argument('--levels', type=str, default='default,small,middle,large')
+    parser.add_argument(
+        '--output_suffix',
+        type=str,
+        default='_s.npy',
+        help="Output filename suffix for encoded features, e.g. _s.npy or _f.npy",
+    )
     args = parser.parse_args()
     
     model_name = args.model_name
@@ -40,31 +69,28 @@ if __name__ == '__main__':
     # encoder_hidden_dims[-1] = args.output_dim
     decoder_hidden_dims = args.decoder_dims
     dataset_path = args.dataset_path
-    ckpt_path = f"ckpt/{model_name}/best_ckpt.pth"
+    ckpt_root = os.path.abspath(os.path.join(dataset_path, "..", "ckpt"))
+    ckpt_path = os.path.join(ckpt_root, model_name, "best_ckpt.pth")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    # data_dir = f"{dataset_path}/language_features"
-    if args.language_name is None:
-        data_dir = f"{dataset_path}/language_features"  
-        output_dir = f"{dataset_path}/language_features_dim{encoder_hidden_dims[-1]}"
-    else:
-        data_dir = os.path.join(dataset_path, args.language_name)
-        if args.output_name is not None:
-            output_dir = os.path.join(dataset_path,f"{args.language_name}-{args.output_name}_dim{encoder_hidden_dims[-1]}")
-        else:    
-            output_dir = os.path.join(dataset_path,f"{args.language_name}-language_features_dim{encoder_hidden_dims[-1]}")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # copy the segmentation map
-    from tqdm import tqdm
-    for filename in tqdm(os.listdir(data_dir)):
-        if filename.endswith("_s.npy"):
-            source_path = os.path.join(data_dir, filename)
-            target_path = os.path.join(output_dir, filename)
-            shutil.copy(source_path, target_path)
+    language_name = args.language_name or "language_features"
+    levels = [x.strip() for x in args.levels.split(",") if x.strip()]
+    feature_files = resolve_feature_files(
+        dataset_path=dataset_path,
+        language_name=language_name,
+        levels=levels,
+    )
+    if len(feature_files) == 0:
+        raise RuntimeError(
+            f"No *_f.npy files found for export under levels={levels} and language_name={language_name}."
+        )
+
+    out_dir_name = f"{args.output_name}_dim{encoder_hidden_dims[-1]}"
 
 
     checkpoint = torch.load(ckpt_path)
-    train_dataset = Autoencoder_dataset(data_dir)
+    train_dataset = Autoencoder_dataset(data_names=feature_files)
 
     test_loader = DataLoader(
         dataset=train_dataset, 
@@ -98,10 +124,23 @@ if __name__ == '__main__':
         else:
             features = np.concatenate([features, outputs], axis=0)
 
-    os.makedirs(output_dir, exist_ok=True)
     start = 0
-    
-    for k,v in train_dataset.data_dic.items():
-        path = os.path.join(output_dir, k)
-        np.save(path, features[start:start+v])
-        start += v
+
+    for info in train_dataset.sample_info:
+        in_path = info["path"]
+        rows = int(info["rows"])
+        src_name = os.path.basename(in_path)
+        if src_name.endswith("_f.npy"):
+            dst_name = src_name.replace("_f.npy", args.output_suffix)
+        else:
+            dst_name = os.path.splitext(src_name)[0] + args.output_suffix
+        dst_root = output_root_for_input(
+            input_f_path=in_path,
+            dataset_path=dataset_path,
+            language_name=language_name,
+            out_dir_name=out_dir_name,
+        )
+        os.makedirs(dst_root, exist_ok=True)
+        out_path = os.path.join(dst_root, dst_name)
+        np.save(out_path, features[start:start + rows])
+        start += rows

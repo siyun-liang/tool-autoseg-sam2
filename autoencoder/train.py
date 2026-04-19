@@ -20,6 +20,16 @@ def cos_loss(network_output, gt):
     return 1 - F.cosine_similarity(network_output, gt, dim=1).mean()
 
 
+def resolve_feature_files(dataset_path, language_name, levels):
+    files = []
+    for lv in levels:
+        lv_dir = os.path.join(dataset_path, lv, language_name)
+        if not os.path.isdir(lv_dir):
+            continue
+        files.extend(sorted([os.path.join(lv_dir, x) for x in os.listdir(lv_dir) if x.endswith("_f.npy")]))
+    return files
+
+
 
 
 
@@ -52,17 +62,27 @@ if __name__ == '__main__':
     parser.add_argument('--cos_weight',type=float,default=1e-3)
     parser.add_argument('--model_name', type=str, required=True)
     parser.add_argument('--language_name', type = str, default = None)
+    parser.add_argument('--levels', type=str, default='default,small,middle,large')
 
     args = parser.parse_args()
     dataset_path = args.dataset_path
     num_epochs = args.num_epochs
-    # import ipdb; ipdb.set_trace()
-    if args.language_name is None:
-        data_dir = f"{dataset_path}/language_features"  
-    else:
-        data_dir = os.path.join(dataset_path, args.language_name)
-    os.makedirs(f'ckpt/{args.model_name}', exist_ok=True)
-    train_dataset = Autoencoder_dataset(data_dir)
+    language_name = args.language_name or "language_features"
+    levels = [x.strip() for x in args.levels.split(",") if x.strip()]
+    feature_files = resolve_feature_files(
+        dataset_path=dataset_path,
+        language_name=language_name,
+        levels=levels,
+    )
+    if len(feature_files) == 0:
+        raise RuntimeError(
+            f"No *_f.npy files found for training under levels={levels} and language_name={language_name}."
+        )
+
+    ckpt_root = os.path.abspath(os.path.join(dataset_path, "..", "ckpt"))
+    model_ckpt_dir = os.path.join(ckpt_root, args.model_name)
+    os.makedirs(model_ckpt_dir, exist_ok=True)
+    train_dataset = Autoencoder_dataset(data_names=feature_files)
     if os.getenv("split_dataset",'f') == 't':
         train_size = int(0.8 * len(train_dataset))
         test_size = len(train_dataset) - train_size
@@ -94,7 +114,7 @@ if __name__ == '__main__':
     model = Autoencoder(encoder_hidden_dims, decoder_hidden_dims, feature_dim=args.feature_dims).to("cuda:0")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    logdir = f'ckpt/{args.model_name}'
+    logdir = model_ckpt_dir
     if os.getenv("wandb",'f') == 't':
         exp_name = os.getenv("expname",'default')
         wandb.init(project="4DLangSplat-autoencoder", name=f"{args.model_name}-{args.language_name}-{exp_name}", config=args)
@@ -176,10 +196,10 @@ if __name__ == '__main__':
             if eval_loss < best_eval_loss:
                 best_eval_loss = eval_loss
                 best_epoch = epoch
-                torch.save(model.state_dict(), f'ckpt/{args.model_name}/best_ckpt.pth')
+                torch.save(model.state_dict(), os.path.join(model_ckpt_dir, "best_ckpt.pth"))
                 
             if epoch % 10 == 0:
-                torch.save(model.state_dict(), f'ckpt/{args.model_name}/{epoch}_ckpt.pth')
+                torch.save(model.state_dict(), os.path.join(model_ckpt_dir, f"{epoch}_ckpt.pth"))
             
     print(f"best_epoch: {best_epoch}")
     print("best_loss: {:.8f}".format(best_eval_loss))
