@@ -18,6 +18,26 @@ def resolve_feature_files(dataset_path, language_name, levels):
     return files
 
 
+def encode_numpy(model, arr: np.ndarray, batch_size: int = 256) -> np.ndarray:
+    if arr.ndim != 2:
+        raise ValueError(f"Expected [N,C] array, got {arr.shape}")
+    outputs = []
+    n = int(arr.shape[0])
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    for st in range(0, n, batch_size):
+        ed = min(st + batch_size, n)
+        data = torch.from_numpy(arr[st:ed]).to("cuda:0").to(torch.float32)
+        with torch.no_grad():
+            if os.getenv("use_vae", 'f') == 't':
+                mu, log_var = model.encode(data)
+                out = model.reparameterize(mu, log_var).to("cpu").numpy()
+            else:
+                out = model.encode(data).to("cpu").numpy()
+        outputs.append(out)
+    return np.concatenate(outputs, axis=0)
+
+
 def output_root_for_input(input_f_path, dataset_path, language_name, out_dir_name):
     # aggregate layout: <dataset>/<level>/<language_name>/<frame>_f.npy
     abs_dataset = os.path.abspath(dataset_path)
@@ -61,6 +81,18 @@ if __name__ == '__main__':
         type=str,
         default='_s.npy',
         help="Output filename suffix for encoded features, e.g. _s.npy or _f.npy",
+    )
+    parser.add_argument(
+        '--object_clip_name',
+        type=str,
+        default='object_clip.npy',
+        help='Per-level object clip filename to read from each level dir.',
+    )
+    parser.add_argument(
+        '--object_clip_output_name',
+        type=str,
+        default='object_clip_dim3.npy',
+        help='Per-level output filename for encoded object clip features.',
     )
     args = parser.parse_args()
     
@@ -111,14 +143,13 @@ if __name__ == '__main__':
     for idx, feature in tqdm(enumerate(test_loader)):
         data = feature.to("cuda:0")
         data = data.to(torch.float32)
-        
+
         with torch.no_grad():
             if os.getenv("use_vae",'f') == 't':
                 mu, log_var  = model.encode(data)
-                outputs = model.reparameterize(mu, log_var).to('cpu').numpy()  
-
+                outputs = model.reparameterize(mu, log_var).to('cpu').numpy()
             else:
-                outputs = model.encode(data).to("cpu").numpy()  
+                outputs = model.encode(data).to("cpu").numpy()
         if idx == 0:
             features = outputs
         else:
@@ -144,3 +175,18 @@ if __name__ == '__main__':
         out_path = os.path.join(dst_root, dst_name)
         np.save(out_path, features[start:start + rows])
         start += rows
+
+    # Also export per-level object clip tables:
+    # <dataset>/<level>/object_clip.npy -> <dataset>/<level>/object_clip_dim3.npy
+    for lv in levels:
+        lv_dir = os.path.join(dataset_path, lv)
+        src_path = os.path.join(lv_dir, args.object_clip_name)
+        if not os.path.isfile(src_path):
+            continue
+        src = np.load(src_path)
+        if src.ndim != 2:
+            raise ValueError(f"Expected [K,C] in {src_path}, got {src.shape}")
+        encoded = encode_numpy(model, src, batch_size=256)
+        dst_path = os.path.join(lv_dir, args.object_clip_output_name)
+        np.save(dst_path, encoded.astype(np.float32))
+        print(f"[object-clip] {src_path} -> {dst_path}, shape={encoded.shape}")

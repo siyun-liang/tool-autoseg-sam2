@@ -25,9 +25,18 @@ python "${AUTOSEG_DIR}/build_level_clip_features.py" \
   --rgb_root "${RGB_ROOT}" \
   --levels "${LEVELS}"
 
+# 2) build per-object CLIP features
+python "${AUTOSEG_DIR}/build_object_clip_from_levels.py" \
+  --output_root "${OUTPUT_ROOT}" \
+  --scene "${SCENE}" \
+  --levels "${LEVELS}" \
+  --weight_mode area \
+  --l2_normalize_input \
+  --l2_normalize_output
+
 cd "${AE_DIR}"
 
-# 2) train AE on aggregated multi-level clip_features (512D -> 3D)
+# 3) train AE on aggregated multi-level clip_features (512D -> 3D)
 python train.py \
   --dataset_path "${DATASET_PATH}" \
   --language_name clip_features \
@@ -40,7 +49,7 @@ python train.py \
   --batch_size 256 \
   --lr 7e-4
 
-# 3) export per-level dim3 features, keep per-frame obj_id row order
+# # 4) export per-level dim3 features, keep per-frame obj_id row order
 python test.py \
   --dataset_path "${DATASET_PATH}" \
   --language_name clip_features \
